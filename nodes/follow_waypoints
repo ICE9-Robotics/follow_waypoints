@@ -6,12 +6,15 @@ import time
 import actionlib
 import rospy
 import tf
+import math
 from actionlib_msgs.msg import GoalID
 from dynamic_reconfigure.server import Server as DynServer
 from follow_waypoints.cfg import FollowWaypointsConfig
 from geometry_msgs.msg import PointStamped, PoseArray, PoseWithCovarianceStamped, Quaternion
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from geometry_msgs.msg import PolygonStamped
 from std_srvs.srv import Trigger
+from tf import transformations as tfs
 
 # Miscellaneous functions
 info = rospy.loginfo
@@ -26,7 +29,6 @@ class Commander(object):
     def __init__(self):
         super(Commander, self).__init__()
         rospy.init_node("follow_waypoints")
-
         # Read parameters off the parameter server --------------------------------------------
         self.frame_id = rospy.get_param("goal_frame_id", "map")
         self.odom_frame_id = rospy.get_param("odom_frame_id", "odom")
@@ -39,8 +41,17 @@ class Commander(object):
         )
         self.waypoints_list_topic = rospy.get_param("waypoints_list_topic", "/waypoints")
 
-        # listen to points or to poses?
-        waypoints_are_poses = rospy.get_param("waypoints_are_poses", True)
+        # waypointsx type
+        if rospy.has_param("waypoints_are_poses"):
+            warn('Parameter "waypoints_are_poses" has been deprecated. Use waypoints_type:=pose|point|polygon instead.')
+            waypoints_are_poses = rospy.get_param("waypoints_are_poses", True)
+            if not rospy.has_param("waypoints_type"):
+                waypoints_type = "pose" if waypoints_are_poses else "point"
+        if rospy.has_param("waypoints_type"):
+            waypoints_type = rospy.get_param("waypoints_type", "pose")
+            if waypoints_type not in ["pose", "point", "polygon"]:
+                waypoints_type = "pose"
+                warn('Waypoints type is unrecogonised; choose from "pose", "point" and "polygon". The default "pose" is used.')
 
         # list of waypoints to follow
         self.waypoints = collections.deque()
@@ -55,7 +66,7 @@ class Commander(object):
         # move_base Action client -------------------------------------------------------------
         self.move_base_client = actionlib.SimpleActionClient("/move_base", MoveBaseAction)
         info("Connecting to move_base...")
-        self.move_base_client.wait_for_server()
+        #self.move_base_client.wait_for_server()
         info("Connected to move_base.")
 
         # TF Initialisation -------------------------------------------------------------------
@@ -72,10 +83,16 @@ class Commander(object):
         )
 
         # Listen to the goal locations
-        self.waypoints_topic_type = (
-            PoseWithCovarianceStamped if waypoints_are_poses else PointStamped
-        )
-        self.waypoints_topic_cb = self.pose_cb if waypoints_are_poses else self.point_cb
+        if waypoints_type == "pose":
+            self.waypoints_topic_type = PoseWithCovarianceStamped
+            self.waypoints_topic_cb = self.pose_cb
+        elif waypoints_type == "point":
+            self.waypoints_topic_type = PointStamped
+            self.waypoints_topic_cb = self.point_cb
+        elif waypoints_type == "polygon":
+            self.waypoints_topic_type = PolygonStamped
+            self.waypoints_topic_cb = self.polygon_cb
+            
         self.waypoints_sub = rospy.Subscriber(
             self.waypoints_to_follow_topic, self.waypoints_topic_type, self.waypoints_topic_cb
         )
@@ -130,6 +147,48 @@ class Commander(object):
             "Added new waypoint -> (%s, %s) | # Waypoints: %s"
             % (pose.pose.pose.position.x, pose.pose.pose.position.y, len(self.waypoints))
         )
+
+    def polygon_cb(self, polygon):
+        """Accept a Polygon message as a list of goals to follow."""
+
+        self.waypoints.clear()
+        def estimate_orientation(cur_point, next_point):
+            angle = math.atan2( next_point.y - cur_point.y, next_point.x - cur_point.x )
+            print("angle: ", angle)
+            q = tfs.quaternion_from_euler(0, 0, angle)
+            return Quaternion(*q)
+        
+        def to_point_struct(header, point):
+            point_ = PointStamped()
+            point_.header = header
+            point_.point = point
+            return point_
+        
+        n_points = len(polygon.polygon.points)
+        
+        if n_points < 2:
+            warn("Polygon has only 1 point")
+            self.waypoints.append(toPoseWithCov(
+                to_point_struct(polygon.header,
+                                polygon.polygon.points[0])))
+
+            return
+        
+        info("Receiving %s waypoints from polygon" % n_points)
+        for i, point in enumerate(polygon.polygon.points):
+            if i < n_points - 1:
+                next_point = polygon.polygon.points[i+1]
+            else:
+                next_point = polygon.polygon.points[0]
+            orientation = estimate_orientation(point, next_point)
+            point_struct = to_point_struct(polygon.header, point)
+            self.waypoints.append(toPoseWithCov(point_struct, orientation))
+
+            info(
+                "Waypoint %s: (%s, %s)"
+                % (i, point.x, point.y)
+            )
+        self.pub_waypoints_list()
 
     def send_move_base_goal(self, pose):
         """Assemble and send a new goal to move_base"""
@@ -214,17 +273,18 @@ def toPoseArray(waypoints):
     return poses
 
 
-def toPoseWithCov(point):
+def toPoseWithCov(point, orientation=None):
     """Convert a PointStamped message to a PoseWithCovarianceStamped."""
     pose = PoseWithCovarianceStamped()
     pose.header = point.header
     pose.pose.pose.position = point.point
-    angle = Quaternion()
-    angle.x = 0
-    angle.y = 0
-    angle.z = 0
-    angle.w = 1
-    pose.pose.pose.orientation = angle
+    if orientation is None:
+        orientation = Quaternion()
+        orientation.x = 0
+        orientation.y = 0
+        orientation.z = 0
+        orientation.w = 1
+    pose.pose.pose.orientation = orientation
 
     return pose
 
