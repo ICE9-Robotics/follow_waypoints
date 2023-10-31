@@ -35,6 +35,7 @@ class Commander(object):
         self.base_frame_id = rospy.get_param("base_frame_id", "base_footprint")
         self.wait_duration = rospy.get_param("wait_duration", 0.0)
         self.distance_tolerance = rospy.get_param("waypoint_distance_tolerance", 0.0)
+        self.distance_tolerance_sq = pow(self.distance_tolerance, 2)
 
         self.waypoints_to_follow_topic = rospy.get_param(
             "waypoints_to_follow_topic", "/initialpose"
@@ -53,6 +54,8 @@ class Commander(object):
                 waypoints_type = "pose"
                 warn('Waypoints type is unrecogonised; choose from "pose", "point" and "polygon". The default "pose" is used.')
 
+        self.start_from_nearest = rospy.get_param("start_from_nearest", False)
+
         # list of waypoints to follow
         self.waypoints = collections.deque()
 
@@ -66,7 +69,7 @@ class Commander(object):
         # move_base Action client -------------------------------------------------------------
         self.move_base_client = actionlib.SimpleActionClient("/move_base", MoveBaseAction)
         info("Connecting to move_base...")
-        #self.move_base_client.wait_for_server()
+        self.move_base_client.wait_for_server()
         info("Connected to move_base.")
 
         # TF Initialisation -------------------------------------------------------------------
@@ -190,6 +193,15 @@ class Commander(object):
             )
         self.pub_waypoints_list()
 
+    def get_current_transform(self):
+        now = rospy.Time.now()
+        self.listener.waitForTransform(
+            self.odom_frame_id, self.base_frame_id, now, rospy.Duration(4.0)
+        )
+        return self.listener.lookupTransform(
+            self.odom_frame_id, self.base_frame_id, now
+        )
+
     def send_move_base_goal(self, pose):
         """Assemble and send a new goal to move_base"""
         goal = MoveBaseGoal()
@@ -202,6 +214,31 @@ class Commander(object):
         )
         self.move_base_client.send_goal(goal)
 
+    def find_nearest_waypoint(self):
+        trans, _ = self.get_current_transform()
+        info("Current trans: %s, %s" % (trans[0], trans[1]))
+        min_dist = float("inf")
+        min_dist_index = 0
+        for i, wp in enumerate(self.waypoints):
+            dist = getDistanceSq(trans[0],trans[1], wp.pose.pose.position.x, wp.pose.pose.position.y)
+            if dist < min_dist:
+                min_dist = dist
+                min_dist_index = i
+        
+        # if the nearest waypoint is too close to the robot, use the next one
+        if min_dist < self.distance_tolerance_sq:
+            min_dist_index += 1
+            if min_dist_index > len(self.waypoints) - 1:
+                min_dist_index = 0
+        info("Starting from the nearest waypoint #%s ..." % min_dist_index)
+        return min_dist_index
+    
+    def goal_reached(self, goal):
+        if self.move_base_client.simple_state == actionlib.SimpleGoalState.DONE:
+            return True
+        trans, _ = self.get_current_transform()
+        return self.distance_tolerance_sq > getDistanceSq(trans[0], trans[1], goal.pose.pose.position.x, goal.pose.pose.position.y)
+    
     def run_once(self):
         """Single iteration of the node loop."""
         if not self.path_ready:
@@ -215,9 +252,11 @@ class Commander(object):
 
         info("Following path with # %s waypoints..." % len(self.waypoints))
 
+        wp_index = self.find_nearest_waypoint() if self.start_from_nearest else 0
+
         # we have waypoints, let's follow them!
         while self.waypoints and not rospy.is_shutdown():
-            goal = self.waypoints[0]
+            goal = self.waypoints[wp_index]
             if self.dyn_config["patrol_mode"]:
                 if len(self.waypoints) == 1:
                     warn(
@@ -230,30 +269,15 @@ class Commander(object):
                 # not in patrol mode - forget about this waypoint
                 self.waypoints.popleft()
             self.send_move_base_goal(goal)
-
-            if not self.distance_tolerance > 0.0:
-                # just wait until move_base reaches the goal...
-                self.move_base_client.wait_for_result()
-                info("Waiting for %f seconds before proceeding to the next goal..." % self.wait_duration)
-                time.sleep(self.wait_duration)
+            
+            if self.distance_tolerance > 0.0:
+                while not rospy.is_shutdown() and not self.goal_reached(goal):
+                    rospy.sleep(rospy.Duration(0,100))
             else:
-                raise NotImplementedError("distance_tolerance not implemented yet.")
+                self.move_base_client.wait_for_result()
 
-                # # TODO - Rewrite
-                # # This is the loop which exist when the robot is near a certain GOAL point.
-                # distance = 10
-                # while distance > self.distance_tolerance:
-                #     now = rospy.Time.now()
-                #     self.listener.waitForTransform(
-                #         self.odom_frame_id, self.base_frame_id, now, rospy.Duration(4.0)
-                #     )
-                #     trans, rot = self.listener.lookupTransform(
-                #         self.odom_frame_id, self.base_frame_id, now
-                #     )
-                #     distance = math.sqrt(
-                #         pow(goal.pose.pose.position.x - trans[0], 2)
-                #         + pow(goal.pose.pose.position.y - trans[1], 2)
-                #     )
+            info("Waiting for %f seconds before proceeding to the next goal..." % self.wait_duration)
+            time.sleep(self.wait_duration)
 
             # current waypoint has now been reached! move on to the next waypoint on the next
             # iteration
@@ -263,6 +287,9 @@ class Commander(object):
         while not rospy.is_shutdown():
             self.run_once()
 
+
+def getDistanceSq(paX, paY, pbX, pbY):
+    return pow(paX - pbX, 2) + pow(paY - pbY, 2)
 
 # helper methods
 def toPoseArray(waypoints):
