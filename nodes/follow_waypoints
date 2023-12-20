@@ -79,6 +79,7 @@ class Commander(object):
         # Subscribers & Publishers & Services initialisation ----------------------------------
         self.path_ready_srv = rospy.Service("path_ready", Trigger, self.make_path_ready)
         self.path_reset_srv = rospy.Service("path_reset", Trigger, self.do_path_reset)
+        self.path_stop_srv = rospy.Service("path_stop", Trigger, self.do_path_stop)
 
         # Publish waypoints as pose array - visualise them in rviz
         self.pose_array_publisher = rospy.Publisher(
@@ -118,6 +119,14 @@ class Commander(object):
         if self.waypoints:
             self.waypoints = collections.deque()
             self.pub_waypoints_list()
+
+        return (True, "")
+    
+    def do_path_stp(self, _):
+        warn("Issuing cancel command to move_base")
+        pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
+        pub.publish(GoalID())
+        warn("move_base goal cancelled.")
 
         return (True, "")
 
