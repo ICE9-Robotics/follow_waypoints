@@ -122,7 +122,7 @@ class Commander(object):
 
         return (True, "")
     
-    def do_path_stp(self, _):
+    def do_path_stop(self, _):
         warn("Issuing cancel command to move_base")
         pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
         pub.publish(GoalID())
